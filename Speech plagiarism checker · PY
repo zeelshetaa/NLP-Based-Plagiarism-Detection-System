@@ -1,0 +1,542 @@
+"""
+Speech-to-Text Plagiarism Detection Module
+============================================
+Integrates speech input with BERT-based semantic similarity checker.
+
+Install dependencies:
+    pip install openai-whisper sounddevice scipy SpeechRecognition pyaudio
+    pip install sentence-transformers scikit-learn nltk PyPDF2
+
+Usage:
+    python speech_plagiarism_checker.py
+"""
+
+import os
+import time
+import wave
+import threading
+import numpy as np
+
+# ── Speech & Audio ──────────────────────────────────────────────────────────
+try:
+    import sounddevice as sd
+    from scipy.io.wavfile import write as wav_write
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+    print("[WARNING] sounddevice not found. Whisper recording disabled.")
+
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("[WARNING] openai-whisper not found. Whisper transcription disabled.")
+
+try:
+    import speech_recognition as sr
+    SR_AVAILABLE = True
+except ImportError:
+    SR_AVAILABLE = False
+    print("[WARNING] SpeechRecognition not found. Google STT disabled.")
+
+# ── NLP & Plagiarism ─────────────────────────────────────────────────────────
+try:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.metrics.pairwise import cosine_similarity
+    import nltk
+    nltk.download('punkt', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    from nltk.tokenize import sent_tokenize
+    from nltk.corpus import stopwords
+    NLP_AVAILABLE = True
+except ImportError:
+    NLP_AVAILABLE = False
+    print("[WARNING] NLP libraries not found. Plagiarism check disabled.")
+
+# ── PDF ───────────────────────────────────────────────────────────────────────
+try:
+    import PyPDF2
+    PDF_AVAILABLE = True
+except ImportError:
+    PDF_AVAILABLE = False
+
+
+# =============================================================================
+# 1. SPEECH-TO-TEXT ENGINES
+# =============================================================================
+
+class WhisperSTT:
+    """
+    Offline speech-to-text using OpenAI Whisper.
+    Best for: accuracy, Hindi support, no internet needed.
+    Model sizes: tiny | base | small | medium | large
+    """
+
+    def __init__(self, model_size="base"):
+        if not WHISPER_AVAILABLE:
+            raise RuntimeError("Install openai-whisper: pip install openai-whisper")
+        print(f"[Whisper] Loading '{model_size}' model...")
+        self.model = whisper.load_model(model_size)
+        self.sample_rate = 16000
+
+    def record_audio(self, duration=10, output_path="recorded_audio.wav"):
+        """Record audio from microphone and save as WAV."""
+        if not SOUNDDEVICE_AVAILABLE:
+            raise RuntimeError("Install sounddevice: pip install sounddevice scipy")
+
+        print(f"[Whisper] Recording for {duration} seconds... Speak now!")
+        audio_data = sd.rec(
+            int(duration * self.sample_rate),
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype='int16'
+        )
+        sd.wait()
+        wav_write(output_path, self.sample_rate, audio_data)
+        print(f"[Whisper] Audio saved to '{output_path}'")
+        return output_path
+
+    def transcribe(self, audio_path, language=None):
+        """
+        Transcribe audio file to text.
+        language: 'en' for English, 'hi' for Hindi, None for auto-detect
+        """
+        print("[Whisper] Transcribing...")
+        options = {"language": language} if language else {}
+        result = self.model.transcribe(audio_path, **options)
+        text = result["text"].strip()
+        print(f"[Whisper] Transcribed: {text}")
+        return text
+
+    def record_and_transcribe(self, duration=10, language=None):
+        """One-step: record then transcribe."""
+        audio_path = self.record_audio(duration=duration)
+        return self.transcribe(audio_path, language=language)
+
+
+class GoogleSTT:
+    """
+    Online speech-to-text using Google Speech Recognition API.
+    Best for: quick demos, viva, internet available.
+    Free tier available. Supports en-IN, hi-IN, gu-IN etc.
+    """
+
+    def __init__(self):
+        if not SR_AVAILABLE:
+            raise RuntimeError("Install SpeechRecognition: pip install SpeechRecognition pyaudio")
+        self.recognizer = sr.Recognizer()
+
+    def listen_and_transcribe(self, language="en-IN", timeout=10, phrase_limit=15):
+        """
+        Listen from microphone and transcribe using Google API.
+        language: 'en-IN', 'hi-IN', 'gu-IN', 'en-US' etc.
+        """
+        with sr.Microphone() as source:
+            print("[Google STT] Adjusting for ambient noise...")
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            print(f"[Google STT] Listening... (max {phrase_limit}s)")
+            try:
+                audio = self.recognizer.listen(
+                    source,
+                    timeout=timeout,
+                    phrase_time_limit=phrase_limit
+                )
+            except sr.WaitTimeoutError:
+                print("[Google STT] No speech detected within timeout.")
+                return ""
+
+        try:
+            print("[Google STT] Transcribing via Google API...")
+            text = self.recognizer.recognize_google(audio, language=language)
+            print(f"[Google STT] Transcribed: {text}")
+            return text
+        except sr.UnknownValueError:
+            print("[Google STT] Could not understand audio.")
+            return ""
+        except sr.RequestError as e:
+            print(f"[Google STT] API error: {e}")
+            return ""
+
+    def transcribe_file(self, audio_path, language="en-IN"):
+        """Transcribe an existing WAV audio file."""
+        with sr.AudioFile(audio_path) as source:
+            audio = self.recognizer.record(source)
+        try:
+            return self.recognizer.recognize_google(audio, language=language)
+        except (sr.UnknownValueError, sr.RequestError) as e:
+            print(f"[Google STT] Error: {e}")
+            return ""
+
+
+# =============================================================================
+# 2. TEXT PREPROCESSING
+# =============================================================================
+
+def preprocess_text(text):
+    """Clean and normalize text for BERT input."""
+    import re
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s\.\,\!\?]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def split_into_sentences(text):
+    """Split text into individual sentences."""
+    if NLP_AVAILABLE:
+        return sent_tokenize(text)
+    # Fallback: simple split
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if len(s.strip()) > 10]
+
+
+# =============================================================================
+# 3. BERT-BASED PLAGIARISM CHECKER
+# =============================================================================
+
+class BERTPlagiarismChecker:
+    """
+    Semantic plagiarism detection using Sentence-BERT embeddings
+    and cosine similarity. Connects directly to your existing project logic.
+    """
+
+    def __init__(self, model_name="paraphrase-MiniLM-L6-v2", threshold=0.75):
+        if not NLP_AVAILABLE:
+            raise RuntimeError("Install: pip install sentence-transformers scikit-learn nltk")
+        print(f"[BERT] Loading model '{model_name}'...")
+        self.model = SentenceTransformer(model_name)
+        self.threshold = threshold
+        print("[BERT] Model loaded.")
+
+    def get_embeddings(self, sentences):
+        """Convert sentences to BERT embeddings."""
+        return self.model.encode(sentences, convert_to_numpy=True)
+
+    def check_two_texts(self, text1, text2):
+        """
+        Compare two texts for plagiarism.
+        Returns dict with overall score and sentence-level matches.
+        """
+        sentences1 = split_into_sentences(preprocess_text(text1))
+        sentences2 = split_into_sentences(preprocess_text(text2))
+
+        if not sentences1 or not sentences2:
+            return {"plagiarism_percentage": 0, "matches": [], "verdict": "No content to compare"}
+
+        embeddings1 = self.get_embeddings(sentences1)
+        embeddings2 = self.get_embeddings(sentences2)
+
+        similarity_matrix = cosine_similarity(embeddings1, embeddings2)
+
+        matches = []
+        plagiarized_count = 0
+
+        for i, sent1 in enumerate(sentences1):
+            max_sim_idx = np.argmax(similarity_matrix[i])
+            max_sim_score = float(similarity_matrix[i][max_sim_idx])
+
+            if max_sim_score >= self.threshold:
+                plagiarized_count += 1
+                pattern = self._detect_pattern(sent1, sentences2[max_sim_idx])
+                matches.append({
+                    "your_sentence": sent1,
+                    "matched_sentence": sentences2[max_sim_idx],
+                    "similarity_score": round(max_sim_score * 100, 2),
+                    "pattern": pattern,
+                    "verdict": self._get_verdict(max_sim_score, pattern)
+                })
+
+        plagiarism_pct = round((plagiarized_count / len(sentences1)) * 100, 2)
+
+        return {
+            "plagiarism_percentage": plagiarism_pct,
+            "total_sentences": len(sentences1),
+            "plagiarized_sentences": plagiarized_count,
+            "matches": matches,
+            "verdict": self._overall_verdict(plagiarism_pct)
+        }
+
+    def _detect_pattern(self, sent1, sent2):
+        """Classify the type of plagiarism pattern."""
+        words1 = set(sent1.lower().split())
+        words2 = set(sent2.lower().split())
+        overlap = words1 & words2
+        unique1 = words1 - words2
+        unique2 = words2 - words1
+
+        overlap_ratio = len(overlap) / max(len(words1), 1)
+
+        if overlap_ratio > 0.7:
+            return "direct_copy"
+        elif len(unique1) > 3 and len(unique2) > 3 and overlap_ratio > 0.3:
+            return "synonym_swap"
+        elif overlap_ratio > 0.4:
+            return "structural_reorder"
+        else:
+            return "deep_paraphrase"
+
+    def _get_verdict(self, score, pattern):
+        """Human-readable explanation for each match."""
+        verdicts = {
+            "direct_copy":       "High word overlap — likely direct copying.",
+            "synonym_swap":      "Different words, same meaning — synonym-based paraphrase.",
+            "structural_reorder":"Same content reordered — structural plagiarism.",
+            "deep_paraphrase":   "Semantically identical — meaning-level paraphrase detected."
+        }
+        return verdicts.get(pattern, "Plagiarism detected.")
+
+    def _overall_verdict(self, pct):
+        if pct >= 70:
+            return "HIGH plagiarism detected"
+        elif pct >= 40:
+            return "MODERATE plagiarism detected"
+        elif pct >= 15:
+            return "LOW plagiarism detected"
+        else:
+            return "Content appears original"
+
+
+# =============================================================================
+# 4. PDF TEXT EXTRACTION (existing feature, unchanged)
+# =============================================================================
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text from a PDF file using PyPDF2."""
+    if not PDF_AVAILABLE:
+        raise RuntimeError("Install PyPDF2: pip install PyPDF2")
+    text = ""
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text += page.extract_text() or ""
+    return text.strip()
+
+
+# =============================================================================
+# 5. REPORT GENERATOR
+# =============================================================================
+
+def print_report(result, input_method="text"):
+    """Print a formatted plagiarism report to console."""
+    line = "=" * 60
+    print(f"\n{line}")
+    print("        PLAGIARISM DETECTION REPORT")
+    print(f"        Input method: {input_method.upper()}")
+    print(line)
+    print(f"  Overall plagiarism : {result['plagiarism_percentage']}%")
+    print(f"  Total sentences    : {result['total_sentences']}")
+    print(f"  Plagiarized        : {result['plagiarized_sentences']}")
+    print(f"  Verdict            : {result['verdict']}")
+    print(line)
+
+    if result['matches']:
+        print(f"\n  FLAGGED SENTENCES ({len(result['matches'])}):\n")
+        for i, match in enumerate(result['matches'], 1):
+            print(f"  [{i}] Similarity: {match['similarity_score']}%")
+            print(f"      Pattern : {match['pattern'].replace('_', ' ').title()}")
+            print(f"      Your    : {match['your_sentence'][:80]}...")
+            print(f"      Source  : {match['matched_sentence'][:80]}...")
+            print(f"      Note    : {match['verdict']}")
+            print()
+    else:
+        print("\n  No significant matches found.\n")
+    print(line)
+
+
+def save_report_txt(result, filename="plagiarism_report.txt", input_method="text"):
+    """Save the plagiarism report to a text file."""
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("PLAGIARISM DETECTION REPORT\n")
+        f.write(f"Input method: {input_method}\n")
+        f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Overall plagiarism: {result['plagiarism_percentage']}%\n")
+        f.write(f"Total sentences: {result['total_sentences']}\n")
+        f.write(f"Plagiarized sentences: {result['plagiarized_sentences']}\n")
+        f.write(f"Verdict: {result['verdict']}\n\n")
+        f.write("FLAGGED SENTENCES:\n")
+        f.write("-" * 40 + "\n")
+        for i, match in enumerate(result['matches'], 1):
+            f.write(f"\n[{i}] Score: {match['similarity_score']}%\n")
+            f.write(f"Pattern: {match['pattern']}\n")
+            f.write(f"Your text: {match['your_sentence']}\n")
+            f.write(f"Source:    {match['matched_sentence']}\n")
+            f.write(f"Note:      {match['verdict']}\n")
+    print(f"[Report] Saved to '{filename}'")
+
+
+# =============================================================================
+# 6. MAIN PIPELINE — ties everything together
+# =============================================================================
+
+class SpeechPlagiarismPipeline:
+    """
+    Complete pipeline:
+    Speech/Text Input → Transcription → BERT Check → Report
+    """
+
+    def __init__(self, stt_engine="google", whisper_model="base", bert_threshold=0.75):
+        """
+        stt_engine: 'google' | 'whisper'
+        whisper_model: 'tiny' | 'base' | 'small' | 'medium'
+        bert_threshold: similarity cutoff (0.0–1.0)
+        """
+        self.bert_threshold = bert_threshold
+
+        # Initialize STT
+        if stt_engine == "whisper":
+            self.stt = WhisperSTT(model_size=whisper_model)
+        else:
+            self.stt = GoogleSTT()
+        self.stt_engine = stt_engine
+
+        # Initialize BERT checker
+        if NLP_AVAILABLE:
+            self.checker = BERTPlagiarismChecker(threshold=bert_threshold)
+        else:
+            self.checker = None
+
+    def run_from_speech(self, reference_text, duration=10, language="en-IN"):
+        """
+        Record speech → transcribe → check against reference text.
+        reference_text: known source to compare against
+        """
+        print("\n[Pipeline] Starting speech input mode...")
+
+        if self.stt_engine == "whisper":
+            spoken_text = self.stt.record_and_transcribe(duration=duration)
+        else:
+            spoken_text = self.stt.listen_and_transcribe(
+                language=language,
+                phrase_limit=duration
+            )
+
+        if not spoken_text:
+            print("[Pipeline] No speech captured. Exiting.")
+            return None
+
+        return self._run_check(spoken_text, reference_text, input_method="speech")
+
+    def run_from_text(self, input_text, reference_text):
+        """Check typed/pasted text against reference."""
+        return self._run_check(input_text, reference_text, input_method="text")
+
+    def run_from_pdf(self, pdf_path, reference_text):
+        """Extract PDF text then check against reference."""
+        print(f"[Pipeline] Extracting text from '{pdf_path}'...")
+        input_text = extract_text_from_pdf(pdf_path)
+        return self._run_check(input_text, reference_text, input_method="pdf")
+
+    def _run_check(self, input_text, reference_text, input_method):
+        """Internal: run BERT check and print report."""
+        if not self.checker:
+            print("[Pipeline] BERT checker not available. Install NLP libraries.")
+            return None
+
+        print(f"\n[Pipeline] Checking {len(input_text)} chars against reference...")
+        result = self.checker.check_two_texts(input_text, reference_text)
+        result["input_text"] = input_text
+
+        print_report(result, input_method=input_method)
+        save_report_txt(result, input_method=input_method)
+        return result
+
+
+# =============================================================================
+# 7. DEMO / ENTRY POINT
+# =============================================================================
+
+def demo_text_mode():
+    """Demo: check two sample texts without microphone."""
+    print("\n" + "="*60)
+    print("  DEMO: Text comparison mode (no mic needed)")
+    print("="*60)
+
+    text1 = """
+    Machine learning algorithms improve their accuracy over time
+    by learning from experience and large amounts of data.
+    Deep neural networks consist of multiple hidden layers
+    that are used for feature extraction and pattern recognition.
+    Gradient descent minimizes the loss function by iteratively
+    adjusting the model weights in small steps.
+    """
+
+    text2 = """
+    ML models get better with more data as they learn from past examples.
+    A deep network has many layers that extract hierarchical features
+    and recognize complex patterns in input data.
+    The optimiser reduces error by updating model parameters step by step
+    to reach the minimum of the objective function.
+    """
+
+    if NLP_AVAILABLE:
+        checker = BERTPlagiarismChecker(threshold=0.70)
+        result = checker.check_two_texts(text1, text2)
+        print_report(result, input_method="text demo")
+        save_report_txt(result, "demo_report.txt", input_method="text")
+    else:
+        print("[Demo] Install NLP libraries to run: pip install sentence-transformers scikit-learn nltk")
+
+
+if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("  SPEECH-TO-TEXT PLAGIARISM DETECTION SYSTEM")
+    print("  Integrates: Whisper / Google STT + BERT + Cosine Similarity")
+    print("="*60)
+
+    print("\nSelect mode:")
+    print("  1. Demo (compare two text samples, no mic)")
+    print("  2. Speech input via Google STT (needs internet)")
+    print("  3. Speech input via Whisper (offline, download model)")
+    print("  4. Type/paste text manually")
+
+    try:
+        choice = input("\nEnter choice (1/2/3/4): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = "1"
+
+    reference = """
+    Machine learning is a subset of artificial intelligence that enables
+    computers to learn from data without being explicitly programmed.
+    Neural networks are computational models inspired by the human brain.
+    """
+
+    if choice == "1":
+        demo_text_mode()
+
+    elif choice == "2":
+        if SR_AVAILABLE:
+            pipeline = SpeechPlagiarismPipeline(stt_engine="google")
+            pipeline.run_from_speech(reference_text=reference, language="en-IN")
+        else:
+            print("Install: pip install SpeechRecognition pyaudio")
+
+    elif choice == "3":
+        if WHISPER_AVAILABLE and SOUNDDEVICE_AVAILABLE:
+            pipeline = SpeechPlagiarismPipeline(stt_engine="whisper", whisper_model="base")
+            pipeline.run_from_speech(reference_text=reference, duration=15)
+        else:
+            print("Install: pip install openai-whisper sounddevice scipy")
+
+    elif choice == "4":
+        print("\nPaste your text (press Enter twice when done):")
+        lines = []
+        try:
+            while True:
+                line = input()
+                if line == "":
+                    break
+                lines.append(line)
+        except EOFError:
+            pass
+        user_text = " ".join(lines)
+        if user_text and NLP_AVAILABLE:
+            checker = BERTPlagiarismChecker(threshold=0.70)
+            result = checker.check_two_texts(user_text, reference)
+            print_report(result, input_method="manual text")
+        else:
+            print("No text entered or NLP libraries missing.")
+    else:
+        print("Invalid choice. Running demo...")
+        demo_text_mode()
